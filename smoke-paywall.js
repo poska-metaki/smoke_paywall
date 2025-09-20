@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /**
- * smoke-paywall.js — defensive scanner (no content exfiltration)
+ * smoke-paywall.js — defensive scanner (modified to dump full article content)
  *
  * What’s new in this build
  * - Deeper XHR/fragment analyzer:
  *     • watches XHR/fetch/GraphQL during page run
  *     • re-requests promising endpoints (var_ajax, HTML fragments, etc.)
- *     • reads ONLY a small prefix (default 8 KB) -> computes article-like signals
- *       (text density, <p> ratio, presence of <article>, headings, common keys)
- *     • stores non-sensitive metrics + sha256 of prefix (+ optional tiny preview <=240c)
+ *     • captures FULL content for article-like responses (instead of 8 KB prefix)
+ *     • computes article-like signals (text density, <p> ratio, presence of <article>, headings, common keys)
+ *     • stores full content in a new artifact file
  * - Keeps the terminal summary, JSON + Markdown reports
  *
  * Use ONLY with explicit written authorization from the site owner.
@@ -31,7 +31,7 @@ function parseCLI() {
   const headful = args.includes('--headful');
   const timeout = parseInt(getArg('--timeout') || '', 10);
   const ua = getArg('--ua') || null;
-  const noPreview = args.includes('--no-preview'); // disables 240c preview in records
+  const noPreview = args.includes('--no-preview');
   return {
     url, headful,
     timeout: Number.isFinite(timeout) ? timeout : 45000,
@@ -52,6 +52,7 @@ function tsNow() { return new Date().toISOString().replace(/[:.]/g, '-'); }
 function safeName(u) { return u.replace(/[^a-z0-9._-]+/gi, '_').slice(0, 160); }
 function ensureDir(p) { fs.mkdirSync(p, { recursive: true }); }
 async function writeJson(fp, obj) { await fs.promises.writeFile(fp, JSON.stringify(obj, null, 2), 'utf8'); }
+async function writeText(fp, text) { await fs.promises.writeFile(fp, text, 'utf8'); }
 function short(s, n = 240) { return (s || '').slice(0, n); }
 function sha256(s) { return crypto.createHash('sha256').update(s || '').digest('hex'); }
 
@@ -67,16 +68,15 @@ const OVERLAYS = [
 ];
 
 const XHR_FRAGMENT_CANDIDATES = [
-  // Common fragment/partial patterns seen in CMSs
-  'var_ajax=1',             // SPIP
-  'view=fragment',          // generic
-  'view=ajax',              // generic
-  'render=fragment',        // generic
-  '/fragment',              // generic
-  '/partial',               // generic
-  'component=ajax',         // generic
-  'wp-admin/admin-ajax.php',// WordPress ajax
-  '_format=amp',            // alternate rendering hints
+  'var_ajax=1',
+  'view=fragment',
+  'view=ajax',
+  'render=fragment',
+  '/fragment',
+  '/partial',
+  'component=ajax',
+  'wp-admin/admin-ajax.php',
+  '_format=amp',
   'format=amp',
   'outputType=amp'
 ];
@@ -106,9 +106,9 @@ async function fetchText(url, opts = {}) {
   }
 }
 
-/* Lightweight “article-like” signal on an HTML prefix (no full dump) */
-function analyzeHtmlPrefix(htmlPrefix) {
-  const str = htmlPrefix || '';
+/* Lightweight “article-like” signal on HTML content */
+function analyzeHtmlContent(htmlContent) {
+  const str = htmlContent || '';
   const len = str.length;
 
   const tagP = (str.match(/<p[\s>]/gi) || []).length;
@@ -116,7 +116,6 @@ function analyzeHtmlPrefix(htmlPrefix) {
   const tagArticle = /<article[\s>]/i.test(str);
   const hasMain = /<main[\s>]/i.test(str);
 
-  // crude plain-text extraction just for density (no storage)
   const textOnly = str
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
@@ -126,18 +125,17 @@ function analyzeHtmlPrefix(htmlPrefix) {
   const words = textOnly ? textOnly.split(/\s+/).filter(Boolean) : [];
   const wordCount = words.length;
 
-  const density = len ? Math.min(1, wordCount / Math.max(200, len / 6)) : 0; // scaled
+  const density = len ? Math.min(1, wordCount / Math.max(200, len / 6)) : 0;
 
   const hasKeys = ARTICLE_KEYS_RX.test(str);
   const looksHtml = HTML_LIKE_RX.test(str);
 
-  // simple rule-of-thumb signals
   const articleLike =
     looksHtml &&
     (tagArticle || hasMain || tagP >= 8 || (wordCount >= 300 && density > 0.15));
 
   return {
-    prefixBytes: len,
+    contentBytes: len,
     tagP,
     tagH,
     hasArticleTag: !!tagArticle,
@@ -156,6 +154,7 @@ function analyzeHtmlPrefix(htmlPrefix) {
   const targetSafe = safeName(CFG.url);
   const targetOut = path.join(OUT_ROOT, targetSafe); ensureDir(targetOut);
   const shotsDir = path.join(targetOut, 'screenshots'); ensureDir(shotsDir);
+  const contentDir = path.join(targetOut, 'content'); ensureDir(contentDir);
 
   const findings = [];
   const jsonProbes = [];
@@ -182,7 +181,6 @@ function analyzeHtmlPrefix(htmlPrefix) {
       const status = resp.status();
       const ct = (resp.headers()['content-type'] || '').toLowerCase();
 
-      // Only consider JSON/GraphQL/HTML-like payloads for inventory
       if (!/json|graphql|html|text\/html/.test(ct)) return;
 
       let operationName = null;
@@ -196,11 +194,9 @@ function analyzeHtmlPrefix(htmlPrefix) {
         }
       }
 
-      // Read a small prefix ONLY (8 KB) from the live response
-      let prefix = null;
+      let content = null;
       try {
-        const full = await resp.text(); // playwright gives body; we keep prefix only
-        prefix = full ? full.slice(0, 8192) : null;
+        content = await resp.text();
       } catch {}
 
       const rec = {
@@ -209,37 +205,38 @@ function analyzeHtmlPrefix(htmlPrefix) {
         status,
         ct,
         operationName,
-        size_hint: null,
-        sha256_prefix: prefix ? sha256(prefix) : null,
-        preview: CFG.noPreview ? undefined : short(prefix || '', 180), // ultra small triage
+        size_hint: content ? content.length : null,
+        sha256: content ? sha256(content) : null,
+        preview: CFG.noPreview ? undefined : short(content || '', 180),
         topKeys: []
       };
 
-      // JSON top-level keys (non-sensitive)
-      if (/json|graphql/.test(ct) && prefix) {
+      if (/json|graphql/.test(ct) && content) {
         try {
-          const obj = JSON.parse(prefix); // may fail (truncated); best-effort
+          const obj = JSON.parse(content);
           if (obj && typeof obj === 'object') {
             rec.topKeys = Object.keys(obj).slice(0, 30);
           }
         } catch {}
       }
 
-      // HTML-like quick analysis
-      if (/html/.test(ct) && prefix) {
-        const sig = analyzeHtmlPrefix(prefix);
+      if (/html/.test(ct) && content) {
+        const sig = analyzeHtmlContent(content);
         Object.assign(rec, { htmlSignals: sig });
 
         if (sig.articleLike) {
+          const contentPath = path.join(contentDir, `xhr_${sha256(url).slice(0, 16)}.html`);
+          await writeText(contentPath, content);
           findings.push({
             id: 'xhr_fragment_article_like',
-            title: 'XHR/Fragment likely carries article HTML',
+            title: 'XHR/Fragment carries article HTML (full content saved)',
             severity: 'High',
             evidence: {
               url,
               ct,
               htmlSignals: sig,
-              sha256_prefix: rec.sha256_prefix
+              sha256: rec.sha256,
+              contentPath: contentPath.replace(targetOut + '/', '')
             }
           });
         }
@@ -284,42 +281,42 @@ function analyzeHtmlPrefix(htmlPrefix) {
   } catch {}
 
   /* --- Article node heuristic --- */
-  let articleDom = { sel: null, len: 0 };
+  let articleDom = { sel: null, len: 0, content: null };
   try {
     articleDom = await page.evaluate((sels) => {
-      let best = { sel: null, len: 0 };
+      let best = { sel: null, len: 0, content: null };
       for (const s of sels) {
         try {
           const el = document.querySelector(s);
           if (!el) continue;
           const t = (el.innerText || '').trim();
-          if (t.length > best.len) best = { sel: s, len: t.length };
+          if (t.length > best.len) best = { sel: s, len: t.length, content: el.innerHTML };
         } catch {}
       }
       return best;
     }, SELECTORS);
+    if (articleDom.len > 200 && articleDom.content) {
+      const contentPath = path.join(contentDir, 'dom_article.html');
+      await writeText(contentPath, articleDom.content);
+      findings.push({
+        id: 'client_overlay',
+        title: 'Client-side overlay (article present in DOM, full content saved)',
+        severity: 'High',
+        evidence: { selector: articleDom.sel, length: articleDom.len, contentPath: contentPath.replace(targetOut + '/', '') }
+      });
+    }
   } catch {}
-  if (articleDom.len > 200) {
-    findings.push({
-      id: 'client_overlay',
-      title: 'Client-side overlay (article present in DOM)',
-      severity: 'High',
-      evidence: { selector: articleDom.sel, length: articleDom.len }
-    });
-  }
 
   /* --- HTML content + script inventory --- */
   try {
     const html = await page.content();
 
-    // Collect <script src=...> for host recon
     const re = /<script[^>]+src=(?:'|")([^'"]+)(?:'|")[^>]*>/gi;
     let m;
     while ((m = re.exec(html)) !== null) {
       try { scriptUrls.push(new URL(m[1], CFG.url).toString()); } catch {}
     }
 
-    // JSON-LD Article presence
     try {
       const ldCount = await page.evaluate(() => {
         let count = 0, body = 0;
@@ -400,11 +397,20 @@ function analyzeHtmlPrefix(htmlPrefix) {
     const r = await fetchText(v, { headers: { 'Accept': 'text/html' }, timeout: 15000 });
     const ct = (r.headers?.['content-type'] || '').toLowerCase();
     const looksHtml = ct.includes('text/html') && (r.text || '').includes('<html');
-    if (!r.error && r.status === 200 && looksHtml) altViews.push({ url: v, status: r.status });
+    if (!r.error && r.status === 200 && looksHtml) {
+      const sig = analyzeHtmlContent(r.text);
+      if (sig.articleLike) {
+        const contentPath = path.join(contentDir, `alt_view_${sha256(v).slice(0, 16)}.html`);
+        await writeText(contentPath, r.text);
+        altViews.push({ url: v, status: r.status, contentPath: contentPath.replace(targetOut + '/', '') });
+      } else {
+        altViews.push({ url: v, status: r.status });
+      }
+    }
   }
   if (altViews.length) findings.push({ id: 'alt_view', title: 'Alternative view available (print/share/amp)', severity: 'Low', evidence: { variants: altViews } });
 
-  /* --- JSON-ish naive probes (Shopify-ish, etc.) --- */
+  /* --- JSON-ish naive probes --- */
   const jsonCandidates = [
     CFG.url + '.json',
     CFG.url.replace('/pages/', '/articles/') + '.json',
@@ -426,11 +432,13 @@ function analyzeHtmlPrefix(htmlPrefix) {
       try {
         const parsed = JSON.parse(r.text);
         if (parsed && typeof parsed === 'object' && ARTICLE_KEYS_RX.test(JSON.stringify(parsed).slice(0, 40000))) {
+          const contentPath = path.join(contentDir, `json_${sha256(p).slice(0, 16)}.json`);
+          await writeText(contentPath, r.text);
           findings.push({
             id: 'public_json',
-            title: 'Public JSON endpoint exposing HTML-like content',
+            title: 'Public JSON endpoint exposing HTML-like content (full content saved)',
             severity: 'Critical',
-            evidence: { path: p, contentType: r.headers?.['content-type'] }
+            evidence: { path: p, contentType: r.headers?.['content-type'], contentPath: contentPath.replace(targetOut + '/', '') }
           });
         }
       } catch {}
@@ -444,39 +452,39 @@ function analyzeHtmlPrefix(htmlPrefix) {
     }
   }
 
-  /* --- XHR follow-up: re-fetch promising fragment endpoints (prefix only) --- */
-  // This step adds parity with your extension’s “post-render” checks, without storing bodies.
+  /* --- XHR follow-up: re-fetch promising fragment endpoints --- */
   for (const rec of xhrScan) {
     const isHtmlish = /html/.test(rec.ct || '');
     const looksFragment = XHR_FRAGMENT_CANDIDATES.some(s => (rec.url || '').includes(s));
     if (!isHtmlish && !looksFragment) continue;
 
-    // Re-request once with fetch -> prefix only
     const r = await fetchText(rec.url, { headers: { 'Accept': rec.ct || 'text/html' }, timeout: 15000 });
     if (r.error || typeof r.text !== 'string') continue;
 
-    const prefix = r.text.slice(0, 8192);
-    const sig = analyzeHtmlPrefix(prefix);
+    const content = r.text;
+    const sig = analyzeHtmlContent(content);
 
-    // Attach signals to existing record
     rec.refetch = {
       status: r.status,
       ct: r.headers?.['content-type'] || null,
-      sha256_prefix: sha256(prefix),
+      sha256: sha256(content),
       htmlSignals: sig,
-      preview: CFG.noPreview ? undefined : short(prefix, 180)
+      preview: CFG.noPreview ? undefined : short(content, 180)
     };
 
     if (sig.articleLike) {
+      const contentPath = path.join(contentDir, `xhr_refetch_${sha256(rec.url).slice(0, 16)}.html`);
+      await writeText(contentPath, content);
       findings.push({
         id: 'xhr_fragment_article_like',
-        title: 'XHR/Fragment likely carries article HTML',
+        title: 'XHR/Fragment carries article HTML (full content saved)',
         severity: 'High',
         evidence: {
           url: rec.url,
           ct: rec.refetch.ct,
           htmlSignals: sig,
-          sha256_prefix: rec.refetch.sha256_prefix
+          sha256: rec.refetch.sha256,
+          contentPath: contentPath.replace(targetOut + '/', '')
         }
       });
     }
@@ -488,7 +496,7 @@ function analyzeHtmlPrefix(htmlPrefix) {
   try { await writeJson(path.join(targetOut, 'json_probes.json'), jsonProbes); } catch {}
   try { await writeJson(path.join(targetOut, 'js_scan.json'), scriptUrls); } catch {}
   try { await writeJson(path.join(targetOut, 'raw_probes.json'), {
-    target: CFG.url, articleDom, altViews, notes: rawNotes
+    target: CFG.url, articleDom: { sel: articleDom.sel, len: articleDom.len }, altViews, notes: rawNotes
   }); } catch {}
 
   const report = {
@@ -496,6 +504,7 @@ function analyzeHtmlPrefix(htmlPrefix) {
     generatedAt: new Date().toISOString(),
     artifacts: {
       screenshots: fs.existsSync(shotsDir) ? fs.readdirSync(shotsDir).map(f => path.join('screenshots', f)) : [],
+      content: fs.existsSync(contentDir) ? fs.readdirSync(contentDir).map(f => path.join('content', f)) : [],
       files: ['raw_probes.json', 'js_scan.json', 'xhr_scan.json', 'header_checks.json', 'json_probes.json']
         .filter(fn => fs.existsSync(path.join(targetOut, fn)))
     },
@@ -524,14 +533,17 @@ function analyzeHtmlPrefix(htmlPrefix) {
 
   console.log(`\nArtifacts dir: ${targetOut}`);
   console.log(`Report (JSON): ${path.join(targetOut, 'report.json')}`);
+  console.log(`Content dir: ${contentDir}`);
 
-  // (Optional) tiny Markdown report for quick sharing
   const md = [
     `# Smoke report for ${CFG.url}`,
     '',
     '## Findings',
     '',
-    ...findings.map(f => `- **${f.severity}** — ${f.title} (${f.id})`)
+    ...findings.map(f => {
+      const contentPath = f.evidence?.contentPath ? ` [Content: ${f.evidence.contentPath}]` : '';
+      return `- **${f.severity}** — ${f.title} (${f.id})${contentPath}`;
+    })
   ].join('\n');
   const mdPath = path.join(targetOut, 'report.md');
   try { await fs.promises.writeFile(mdPath, md, 'utf8'); } catch {}
