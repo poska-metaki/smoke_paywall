@@ -4,6 +4,8 @@ This tool probes a target article page for common content-exposure vectors (publ
 
 **Important:** This repository is intended for authorized security testing only. Do **not** use findings against sites for which you do not have explicit written permission.
 
+<img width="2076" height="1112" alt="console" src="https://github.com/user-attachments/assets/b0b2119b-32c6-417c-a6cf-886ab7faedca" />
+
 ---
 
 ## Features
