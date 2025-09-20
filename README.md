@@ -17,7 +17,7 @@ This tool probes a target article page for common content-exposure vectors (publ
   - Client-side overlays (content present in the DOM)
   - "Paywall-like" JS, global metering variables, @media print stylesheets, Service Worker
 
-- Produces a precise, machine-readable `report.json` with:
+- Produces a precise, machine-readable reports:
   - report.json — Structured summary of findings (id, title, severity, short description) + synthetic evidence (paths, snippets, metrics)
   - raw_probes.json — Raw probe data (tested requests, statuses, errors, timings).
   - js_scan.json — List of script URLs found in HTML (for asset/host reconnaissance).
@@ -45,6 +45,12 @@ npx playwright install
 
 ```bash
 node smoke-paywall.js --url "https://example.com/pages/article-handle"
+```
+
+options:
+
+```bash
+ --headful  --timeout 60000  --ua "MyUA/1.0"
 ```
 
 ## Legal & ethical
