@@ -2,7 +2,7 @@
 
 This tool probes a target article page for common content-exposure vectors (public JSON endpoints, client-side overlays, UA/referrer differences, blockable paywall scripts, and origin/API hints).  
 
-**Important:** This repository is intended for authorized security testing only. Do **not** run these PoCs against sites for which you do not have explicit written permission.
+**Important:** This repository is intended for authorized security testing only. Do **not** use findings against sites for which you do not have explicit written permission.
 
 ---
 
