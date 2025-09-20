@@ -1,17 +1,25 @@
 #!/usr/bin/env node
 /**
- * smoke-paywall.js
+ * smoke-paywall.js — defensive scanner (no content exfiltration)
  *
- * Usage:
- *   node smoke-paywall.js --url "https://site/article" [--headful] [--timeout 60000] [--ua "UA String"]
+ * What’s new in this build
+ * - Deeper XHR/fragment analyzer:
+ *     • watches XHR/fetch/GraphQL during page run
+ *     • re-requests promising endpoints (var_ajax, HTML fragments, etc.)
+ *     • reads ONLY a small prefix (default 8 KB) -> computes article-like signals
+ *       (text density, <p> ratio, presence of <article>, headings, common keys)
+ *     • stores non-sensitive metrics + sha256 of prefix (+ optional tiny preview <=240c)
+ * - Keeps the terminal summary, JSON + Markdown reports
  *
+ * Use ONLY with explicit written authorization from the site owner.
  */
 
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
-/* ------------------------------- CLI ----------------------------------- */
+/* ------------------------------ CLI ------------------------------ */
 
 function parseCLI() {
   const args = process.argv.slice(2);
@@ -22,27 +30,34 @@ function parseCLI() {
   const url = getArg('--url') || process.env.TEST_URL || null;
   const headful = args.includes('--headful');
   const timeout = parseInt(getArg('--timeout') || '', 10);
-  const userAgent = getArg('--ua') || null;
-  return { url, headful, timeout: Number.isFinite(timeout) ? timeout : 45000, userAgent };
+  const ua = getArg('--ua') || null;
+  const noPreview = args.includes('--no-preview'); // disables 240c preview in records
+  return {
+    url, headful,
+    timeout: Number.isFinite(timeout) ? timeout : 45000,
+    userAgent: ua,
+    noPreview
+  };
 }
-const { url: TEST_URL, headful: HEADFUL, timeout: NAV_TIMEOUT, userAgent: UA_OVERRIDE } = parseCLI();
-if (!TEST_URL) {
+
+const CFG = parseCLI();
+if (!CFG.url) {
   console.error('ERROR: provide --url or TEST_URL env var');
   process.exit(2);
 }
 
-/* ----------------------------- Utils ----------------------------------- */
+/* ---------------------------- Utilities --------------------------- */
 
 function tsNow() { return new Date().toISOString().replace(/[:.]/g, '-'); }
 function safeName(u) { return u.replace(/[^a-z0-9._-]+/gi, '_').slice(0, 160); }
 function ensureDir(p) { fs.mkdirSync(p, { recursive: true }); }
 async function writeJson(fp, obj) { await fs.promises.writeFile(fp, JSON.stringify(obj, null, 2), 'utf8'); }
-function short(s, n = 300) { return (s || '').slice(0, n); }
+function short(s, n = 240) { return (s || '').slice(0, n); }
+function sha256(s) { return crypto.createHash('sha256').update(s || '').digest('hex'); }
 
-const OUT_ROOT = `./smoke_paywall_${tsNow()}`;
-ensureDir(OUT_ROOT);
+const OUT_ROOT = `./smoke_paywall_${tsNow()}`; ensureDir(OUT_ROOT);
 
-/* -------------------------- Heuristics --------------------------------- */
+/* ----------------------------- Heuristics ------------------------- */
 
 const SELECTORS = ['main', 'article', '.post-content', '.entry-content', '.page-content'];
 const OVERLAYS = [
@@ -51,21 +66,25 @@ const OVERLAYS = [
   '#CybotCookiebotDialog', '.issue-article-cover'
 ];
 
-function isJsonCT(r) {
-  const ct = (r.headers?.['content-type'] || '').toLowerCase();
-  return ct.includes('application/json') || ct.includes('+json');
-}
-function hasArticleFieldsObj(obj) {
-  if (!obj || typeof obj !== 'object') return false;
-  const s = JSON.stringify(obj).toLowerCase();
-  return /\b(body_html|articlebody|"body":|"rendered":|"renderedbody"|content_html|contenthtml|content\.blocks)\b/.test(s);
-}
-function hasArticleFieldsText(txt) {
-  if (!txt) return false;
-  return /"body_html"|"articleBody"|"renderedBody"|"content_html"|"contentHtml"|"<article"|"<main"/i.test(txt);
-}
+const XHR_FRAGMENT_CANDIDATES = [
+  // Common fragment/partial patterns seen in CMSs
+  'var_ajax=1',             // SPIP
+  'view=fragment',          // generic
+  'view=ajax',              // generic
+  'render=fragment',        // generic
+  '/fragment',              // generic
+  '/partial',               // generic
+  'component=ajax',         // generic
+  'wp-admin/admin-ajax.php',// WordPress ajax
+  '_format=amp',            // alternate rendering hints
+  'format=amp',
+  'outputType=amp'
+];
 
-/* ----------------------------- Fetch helper ---------------------------- */
+const ARTICLE_KEYS_RX = /\b(body_html|articleBody|renderedBody|content_html|contentHtml|content\.blocks|paragraphs|paywall|meter|entitlement|subscribe)\b/i;
+const HTML_LIKE_RX = /<html|<article|<main|<p[\s>]/i;
+
+/* ----------------------------- HTTP helper ------------------------ */
 
 async function fetchText(url, opts = {}) {
   try {
@@ -74,7 +93,10 @@ async function fetchText(url, opts = {}) {
     const r = await fetch(url, {
       redirect: 'follow',
       signal: controller.signal,
-      headers: { 'User-Agent': UA_OVERRIDE || 'smoke-paywall/1.0', ...(opts.headers || {}) }
+      headers: {
+        'User-Agent': CFG.userAgent || 'smoke-paywall/1.1',
+        ...(opts.headers || {})
+      }
     });
     clearTimeout(t);
     const text = await r.text().catch(() => null);
@@ -84,35 +106,57 @@ async function fetchText(url, opts = {}) {
   }
 }
 
-/* ------------- Inline hydration & script tag parsing ------------------- */
+/* Lightweight “article-like” signal on an HTML prefix (no full dump) */
+function analyzeHtmlPrefix(htmlPrefix) {
+  const str = htmlPrefix || '';
+  const len = str.length;
 
-function extractHydrationBlobsFromHtml(html) {
-  const blobs = [];
-  const patterns = [
-    /<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/ig,
-    /<script[^>]+id=["']__NUXT__["'][^>]*>([\s\S]*?)<\/script>/ig,
-    /<script[^>]*>\s*window\.__APOLLO_STATE__\s*=\s*(\{[\s\S]*?\})\s*;<\/script>/ig,
-    /<script[^>]*>\s*window\.__INITIAL_STATE__\s*=\s*(\{[\s\S]*?\})\s*;<\/script>/ig,
-    /<script[^>]*>\s*window\.__data\s*=\s*(\{[\s\S]*?\})\s*;<\/script>/ig
-  ];
-  for (const re of patterns) {
-    let m;
-    while ((m = re.exec(html)) !== null) {
-      try { blobs.push(JSON.parse(m[1])); } catch { /* ignore */ }
-    }
-  }
-  return blobs;
+  const tagP = (str.match(/<p[\s>]/gi) || []).length;
+  const tagH = (str.match(/<h[1-3][\s>]/gi) || []).length;
+  const tagArticle = /<article[\s>]/i.test(str);
+  const hasMain = /<main[\s>]/i.test(str);
+
+  // crude plain-text extraction just for density (no storage)
+  const textOnly = str
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const words = textOnly ? textOnly.split(/\s+/).filter(Boolean) : [];
+  const wordCount = words.length;
+
+  const density = len ? Math.min(1, wordCount / Math.max(200, len / 6)) : 0; // scaled
+
+  const hasKeys = ARTICLE_KEYS_RX.test(str);
+  const looksHtml = HTML_LIKE_RX.test(str);
+
+  // simple rule-of-thumb signals
+  const articleLike =
+    looksHtml &&
+    (tagArticle || hasMain || tagP >= 8 || (wordCount >= 300 && density > 0.15));
+
+  return {
+    prefixBytes: len,
+    tagP,
+    tagH,
+    hasArticleTag: !!tagArticle,
+    hasMain,
+    wordCount,
+    density: Number(density.toFixed(3)),
+    hasArticleKeys: hasKeys,
+    looksHtml,
+    articleLike
+  };
 }
 
-/* ------------------------------ Main ----------------------------------- */
+/* ----------------------------- Main flow -------------------------- */
 
 (async () => {
-  const targetSafe = safeName(TEST_URL);
-  const targetOut = path.join(OUT_ROOT, targetSafe);
-  ensureDir(targetOut);
+  const targetSafe = safeName(CFG.url);
+  const targetOut = path.join(OUT_ROOT, targetSafe); ensureDir(targetOut);
   const shotsDir = path.join(targetOut, 'screenshots'); ensureDir(shotsDir);
 
-  // Collected artifacts
   const findings = [];
   const jsonProbes = [];
   const headerChecks = [];
@@ -120,157 +164,100 @@ function extractHydrationBlobsFromHtml(html) {
   const xhrScan = [];
   const altViews = [];
   const rawNotes = [];
-  const mainRequest = { url: TEST_URL, headers: null, status: null, responseHeaders: null, csp: null, robots: null };
 
-  // --- Launch browser with early hooks & CDP ---
-  const launchOpts = { headless: !HEADFUL };
-  const contextOpts = {};
-  if (UA_OVERRIDE) contextOpts.userAgent = UA_OVERRIDE;
+  const launchOpts = { headless: !CFG.headful };
+  const ctxOpts = {};
+  if (CFG.userAgent) ctxOpts.userAgent = CFG.userAgent;
 
   const browser = await chromium.launch(launchOpts);
-  const context = await browser.newContext(contextOpts);
+  const context = await browser.newContext(ctxOpts);
   const page = await context.newPage();
 
-  // 1) CDP session for early network observation (metadata only)
-  const session = await context.newCDPSession(page);
-  await session.send('Network.enable');
-  await session.send('Page.enable');
-
-  session.on('Network.requestWillBeSent', (ev) => {
-    // We don’t store bodies here. Metadata only.
-    if (ev.documentURL === TEST_URL && ev.type === 'Document') {
-      mainRequest.headers = ev.request.headers || null;
-    }
-  });
-  session.on('Network.responseReceived', (ev) => {
-    if (ev.type === 'Document' && ev.response?.url?.split('#')[0] === TEST_URL.split('#')[0]) {
-      mainRequest.status = ev.response.status;
-      mainRequest.responseHeaders = ev.response.headers || null;
-      mainRequest.csp = (ev.response.headers?.['content-security-policy'] || ev.response.headers?.['Content-Security-Policy']) || null;
-      mainRequest.robots = (ev.response.headers?.['x-robots-tag'] || ev.response.headers?.['X-Robots-Tag']) || null;
-    }
-  });
-
-  // 2) document_start style init script: instrument fetch/XHR (metadata only)
-  await context.addInitScript(() => {
-    // This runs before any page script (as close as possible).
-    try {
-      const _origFetch = window.fetch;
-      window.fetch = async function(input, init) {
-        try {
-          const url = (typeof input === 'string') ? input : (input?.url || '');
-          const method = (init && init.method) || 'GET';
-          const body = (init && init.body) || null;
-          let opName = null;
-          if (method === 'POST' && body && typeof body === 'string' && body.length < 50000) {
-            try { opName = (JSON.parse(body)||{}).operationName || null; } catch {}
-          }
-          window.__smoke_log && window.__smoke_log({ t:'fetch', url, method, opName });
-        } catch {}
-        return _origFetch.apply(this, arguments);
-      };
-
-      const _origOpen = XMLHttpRequest.prototype.open;
-      const _origSend = XMLHttpRequest.prototype.send;
-      XMLHttpRequest.prototype.open = function(method, url) {
-        try { this.__smoke = { method, url }; } catch {}
-        return _origOpen.apply(this, arguments);
-      };
-      XMLHttpRequest.prototype.send = function(body) {
-        try {
-          if (body && typeof body === 'string' && body.length < 50000) {
-            try { this.__smoke.opName = (JSON.parse(body)||{}).operationName || null; } catch {}
-          }
-          const info = this.__smoke || {};
-          window.__smoke_log && window.__smoke_log({ t:'xhr', url: info.url, method: info.method, opName: info.opName });
-        } catch {}
-        return _origSend.apply(this, arguments);
-      };
-
-      // lightweight bus to page for Playwright to read
-      window.__smoke_events = [];
-      window.__smoke_log = (e) => { try { window.__smoke_events.push(e); } catch {} };
-
-      // Observe one-time writes to common gating globals (metadata only)
-      const watchKeys = ['piano', 'poool', 'meter', 'paywall', 'entitlement', 'subscribe', 'metering'];
-      watchKeys.forEach((k) => {
-        try {
-          if (Object.prototype.hasOwnProperty.call(window, k)) return;
-          let _val;
-          Object.defineProperty(window, k, {
-            configurable: true,
-            set(v) { _val = v; try { window.__smoke_log({ t:'global_set', key: k, typeof: typeof v }); } catch {} },
-            get() { return _val; }
-          });
-        } catch {}
-      });
-    } catch {}
-  });
-
-  // 3) Playwright-level response observer (JSON/GraphQL metadata)
+  /* --- Observe XHR/fetch/GraphQL while the page runs --- */
   page.on('response', async (resp) => {
     try {
-      const url = resp.url();
-      const ct = (resp.headers()['content-type'] || '').toLowerCase();
-      if (!/json|graphql/.test(ct)) return;
-
-      const status = resp.status();
       const req = resp.request();
-      const reqUrl = req.url();
+      const url = req.url();
       const method = req.method();
+      const status = resp.status();
+      const ct = (resp.headers()['content-type'] || '').toLowerCase();
+
+      // Only consider JSON/GraphQL/HTML-like payloads for inventory
+      if (!/json|graphql|html|text\/html/.test(ct)) return;
 
       let operationName = null;
       if (method === 'POST') {
-        const pd = req.postData();
-        if (pd && pd.length < 200000) {
-          try { operationName = (JSON.parse(pd)||{}).operationName || null; } catch {}
+        const body = req.postData();
+        if (body && body.length < 200000) {
+          try {
+            const parsed = JSON.parse(body);
+            operationName = parsed?.operationName || null;
+          } catch {}
         }
       }
 
-      // Read small slice to extract top-level keys only (no full body saved)
-      const text = await resp.text().catch(() => null);
-      let keys = [];
-      if (text) { try { const obj = JSON.parse(text); if (obj && typeof obj === 'object') keys = Object.keys(obj).slice(0, 30); } catch {} }
+      // Read a small prefix ONLY (8 KB) from the live response
+      let prefix = null;
+      try {
+        const full = await resp.text(); // playwright gives body; we keep prefix only
+        prefix = full ? full.slice(0, 8192) : null;
+      } catch {}
 
-      xhrScan.push({
-        url: reqUrl,
+      const rec = {
+        url,
         method,
         status,
         ct,
         operationName,
-        size: text ? text.length : null,
-        topKeys: keys
-      });
+        size_hint: null,
+        sha256_prefix: prefix ? sha256(prefix) : null,
+        preview: CFG.noPreview ? undefined : short(prefix || '', 180), // ultra small triage
+        topKeys: []
+      };
 
-      if (text && hasArticleFieldsText(text)) {
-        findings.push({
-          id: 'xhr_article_like',
-          title: 'XHR/GraphQL likely carries article HTML',
-          severity: 'High',
-          evidence: { url: reqUrl, status, ct, operationName, sampleKeys: keys }
-        });
+      // JSON top-level keys (non-sensitive)
+      if (/json|graphql/.test(ct) && prefix) {
+        try {
+          const obj = JSON.parse(prefix); // may fail (truncated); best-effort
+          if (obj && typeof obj === 'object') {
+            rec.topKeys = Object.keys(obj).slice(0, 30);
+          }
+        } catch {}
       }
+
+      // HTML-like quick analysis
+      if (/html/.test(ct) && prefix) {
+        const sig = analyzeHtmlPrefix(prefix);
+        Object.assign(rec, { htmlSignals: sig });
+
+        if (sig.articleLike) {
+          findings.push({
+            id: 'xhr_fragment_article_like',
+            title: 'XHR/Fragment likely carries article HTML',
+            severity: 'High',
+            evidence: {
+              url,
+              ct,
+              htmlSignals: sig,
+              sha256_prefix: rec.sha256_prefix
+            }
+          });
+        }
+      }
+
+      xhrScan.push(rec);
     } catch {}
   });
 
-  /* ----------------------------- Navigate ------------------------------- */
+  /* --- Navigate --- */
   try {
-    await page.goto(TEST_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+    await page.goto(CFG.url, { waitUntil: 'domcontentloaded', timeout: CFG.timeout });
     await page.waitForTimeout(800);
   } catch (e) {
     rawNotes.push(`[nav] error: ${String(e).slice(0, 200)}`);
   }
 
-  // Drain initScript events (fetch/xhr starts) — *metadata only*
-  try {
-    const early = await page.evaluate(() => (Array.isArray(window.__smoke_events) ? window.__smoke_events.splice(0) : []));
-    if (early && early.length) {
-      // Merge as "earlyHooks" in raw notes
-      rawNotes.push({ earlyHooks: early.slice(0, 200) });
-    }
-  } catch {}
-
-  // Screenshots (baseline → esc → scroll → hide overlays)
+  /* --- Basic diagnostics --- */
   try { await page.screenshot({ path: path.join(shotsDir, '01_baseline.png'), fullPage: true }); } catch {}
   try {
     const btn = page.locator(
@@ -296,7 +283,7 @@ function extractHydrationBlobsFromHtml(html) {
     await page.screenshot({ path: path.join(shotsDir, '04_after_css_hide.png'), fullPage: true });
   } catch {}
 
-  /* ----------------------- Article-like DOM detection -------------------- */
+  /* --- Article node heuristic --- */
   let articleDom = { sel: null, len: 0 };
   try {
     articleDom = await page.evaluate((sels) => {
@@ -321,78 +308,48 @@ function extractHydrationBlobsFromHtml(html) {
     });
   }
 
-  /* ------------------------- AMP & JSON-LD ------------------------------ */
-  try {
-    const ampHref = await page.evaluate(() => document.querySelector('link[rel="amphtml"]')?.href || null);
-    if (ampHref) findings.push({ id: 'amp_variant', title: 'AMP variant advertised', severity: 'Info', evidence: { url: ampHref } });
-  } catch {}
-
-  try {
-    const ld = await page.evaluate(() => {
-      const out = [];
-      for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
-        try {
-          const o = JSON.parse(s.textContent || '{}');
-          const arr = Array.isArray(o) ? o : [o];
-          for (const item of arr) {
-            if (!item || typeof item !== 'object') continue;
-            if (item['@type'] && String(item['@type']).toLowerCase().includes('article')) {
-              out.push({ hasArticleBody: !!item.articleBody, keys: Object.keys(item).slice(0, 20) });
-            }
-          }
-        } catch {}
-      }
-      return out;
-    });
-    if (ld && ld.some(x => x.hasArticleBody)) {
-      findings.push({ id: 'jsonld_article', title: 'JSON-LD Article present', severity: 'Info', evidence: { count: ld.length, articleBodyAny: true } });
-    } else if (ld && ld.length) {
-      findings.push({ id: 'jsonld_present', title: 'JSON-LD present (non-articleBody)', severity: 'Info', evidence: { count: ld.length } });
-    }
-  } catch {}
-
-  /* ------------------ Inline hydration & script src scan ----------------- */
+  /* --- HTML content + script inventory --- */
   try {
     const html = await page.content();
 
-    // <link rel="alternate" ... application/json|+json|oembed>
-    try {
-      const altJson = [...html.matchAll(/<link[^>]+rel=["']alternate["'][^>]+type=["']([^"']*json[^"']*)["'][^>]+href=["']([^"']+)["']/ig)]
-        .slice(0, 10)
-        .map(m => ({ type: m[1], href: new URL(m[2], TEST_URL).toString() }));
-      if (altJson.length) findings.push({ id: 'alternate_json', title: 'Alternate JSON endpoints advertised', severity: 'Info', evidence: { links: altJson } });
-    } catch {}
-
-    const blobs = extractHydrationBlobsFromHtml(html);
-    if (blobs.length) {
-      const flagged = blobs.some(hasArticleFieldsObj);
-      const sampleKeys = blobs.slice(0, 3).map(b => Object.keys(b || {}).slice(0, 20));
-      findings.push({
-        id: 'inline_hydration',
-        title: 'Inline hydration JSON detected',
-        severity: flagged ? 'High' : 'Info',
-        evidence: { blobs: blobs.length, articleLike: flagged, sampleTopKeys: sampleKeys }
-      });
-    }
-
-    // collect <script src=...>
+    // Collect <script src=...> for host recon
     const re = /<script[^>]+src=(?:'|")([^'"]+)(?:'|")[^>]*>/gi;
     let m;
     while ((m = re.exec(html)) !== null) {
-      try { scriptUrls.push(new URL(m[1], TEST_URL).toString()); } catch {}
+      try { scriptUrls.push(new URL(m[1], CFG.url).toString()); } catch {}
     }
+
+    // JSON-LD Article presence
+    try {
+      const ldCount = await page.evaluate(() => {
+        let count = 0, body = 0;
+        for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
+          try {
+            const o = JSON.parse(s.textContent || '{}');
+            const arr = Array.isArray(o) ? o : [o];
+            for (const item of arr) {
+              if (item && typeof item === 'object' && String(item['@type'] || '').toLowerCase().includes('article')) {
+                count++;
+                if (item.articleBody) body++;
+              }
+            }
+          } catch {}
+        }
+        return { count, withBody: body };
+      });
+      if (ldCount.count) {
+        findings.push({
+          id: ldCount.withBody ? 'jsonld_article' : 'jsonld_present',
+          title: ldCount.withBody ? 'JSON-LD Article present' : 'JSON-LD present (non-articleBody)',
+          severity: 'Info',
+          evidence: ldCount
+        });
+      }
+    } catch {}
+
   } catch {}
 
-  // JS filenames with paywall-ish markers
-  try {
-    const pw = scriptUrls.filter(u => /paywall|gate|meter|subscribe|fr-gate|pay-wall|metering|piano|poool/i.test(u));
-    if (pw.length) {
-      findings.push({ id: 'paywall_js_candidates', title: 'Paywall-like JS filenames present', severity: 'Medium', evidence: { count: pw.length, samples: pw.slice(0, 20) } });
-    }
-    await writeJson(path.join(targetOut, 'js_scan.json'), scriptUrls);
-  } catch {}
-
-  // Print CSS hint
+  /* --- Print CSS present? --- */
   try {
     const hasPrint = await page.evaluate(() => {
       try {
@@ -407,16 +364,18 @@ function extractHydrationBlobsFromHtml(html) {
     if (hasPrint) findings.push({ id: 'print_css', title: 'Print stylesheet detected', severity: 'Info' });
   } catch {}
 
-  // window globals
+  /* --- window globals --- */
   try {
     const globals = await page.evaluate(() => {
       const keys = Object.getOwnPropertyNames(window);
       return keys.filter(k => /piano|poool|meter|paywall|entitlement|subscribe|metering/i.test(k)).slice(0, 100);
     });
-    if (globals.length) findings.push({ id: 'global_flags', title: 'Potential metering/paywall globals on window', severity: 'Info', evidence: { keys: globals } });
+    if (globals.length) {
+      findings.push({ id: 'global_flags', title: 'Potential metering/paywall globals on window', severity: 'Info', evidence: { keys: globals } });
+    }
   } catch {}
 
-  // Service worker
+  /* --- Service Worker presence --- */
   try {
     const swInfo = await page.evaluate(async () => {
       try {
@@ -428,7 +387,7 @@ function extractHydrationBlobsFromHtml(html) {
     if (swInfo?.supported) findings.push({ id: 'service_worker', title: 'Service Worker present', severity: 'Info', evidence: swInfo });
   } catch {}
 
-  /* -------------------------- URL Variants ------------------------------ */
+  /* --- Alternate views quick probes --- */
   const variantMakers = [
     (u) => u.replace(/\/$/, '') + '/amp',
     (u) => u + (u.includes('?') ? '&' : '?') + 'print=1',
@@ -436,8 +395,8 @@ function extractHydrationBlobsFromHtml(html) {
     (u) => u + (u.includes('?') ? '&' : '?') + 'outputType=amp'
   ];
   for (const make of variantMakers) {
-    const v = make(TEST_URL);
-    if (!v || v === TEST_URL) continue;
+    const v = make(CFG.url);
+    if (!v || v === CFG.url) continue;
     const r = await fetchText(v, { headers: { 'Accept': 'text/html' }, timeout: 15000 });
     const ct = (r.headers?.['content-type'] || '').toLowerCase();
     const looksHtml = ct.includes('text/html') && (r.text || '').includes('<html');
@@ -445,13 +404,13 @@ function extractHydrationBlobsFromHtml(html) {
   }
   if (altViews.length) findings.push({ id: 'alt_view', title: 'Alternative view available (print/share/amp)', severity: 'Low', evidence: { variants: altViews } });
 
-  /* -------------------------- JSON Endpoint Probes ---------------------- */
+  /* --- JSON-ish naive probes (Shopify-ish, etc.) --- */
   const jsonCandidates = [
-    TEST_URL + '.json',
-    TEST_URL.replace('/pages/', '/articles/') + '.json',
-    TEST_URL.replace('/pages/', '/api/pages/'),
-    TEST_URL + '?view=json',
-    TEST_URL + '?format=json'
+    CFG.url + '.json',
+    CFG.url.replace('/pages/', '/articles/') + '.json',
+    CFG.url.replace('/pages/', '/api/pages/'),
+    CFG.url + '?view=json',
+    CFG.url + '?format=json'
   ];
   const seen = new Set();
   for (const p of jsonCandidates) {
@@ -462,17 +421,20 @@ function extractHydrationBlobsFromHtml(html) {
 
     if (r.error) continue;
 
-    let parsed = null;
-    if (isJsonCT(r)) { try { parsed = JSON.parse(r.text); } catch {} }
-
-    if (parsed && hasArticleFieldsObj(parsed)) {
-      findings.push({
-        id: 'public_json',
-        title: 'Public JSON endpoint exposing HTML-like content',
-        severity: 'Critical',
-        evidence: { path: p, contentType: r.headers?.['content-type'] }
-      });
-    } else if (r.status === 200 && !isJsonCT(r)) {
+    const ct = (r.headers?.['content-type'] || '').toLowerCase();
+    if (ct.includes('application/json') || ct.includes('+json')) {
+      try {
+        const parsed = JSON.parse(r.text);
+        if (parsed && typeof parsed === 'object' && ARTICLE_KEYS_RX.test(JSON.stringify(parsed).slice(0, 40000))) {
+          findings.push({
+            id: 'public_json',
+            title: 'Public JSON endpoint exposing HTML-like content',
+            severity: 'Critical',
+            evidence: { path: p, contentType: r.headers?.['content-type'] }
+          });
+        }
+      } catch {}
+    } else if (r.status === 200 && !ct.includes('json')) {
       findings.push({
         id: 'json_probe_html',
         title: 'Endpoint returned HTML (not JSON)',
@@ -482,97 +444,100 @@ function extractHydrationBlobsFromHtml(html) {
     }
   }
 
-  /* ------------------------- UA / Referer Matrix ------------------------ */
-  const headerMatrix = [
-    { name: 'default',   opts: {} },
-    { name: 'googlebot', opts: { userAgent: 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' } },
-    { name: 'ref_google',opts: { extraHTTPHeaders: { referer: 'https://www.google.com/' } } },
-    { name: 'mobile_ios',opts: { userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1' } },
-    { name: 'facebook',  opts: { extraHTTPHeaders: { referer: 'https://m.facebook.com/' } } },
-    { name: 'twitter',   opts: { extraHTTPHeaders: { referer: 'https://t.co/' } } },
-  ];
-  for (const h of headerMatrix) {
-    try {
-      const ctx = await browser.newContext(h.opts);
-      const p = await ctx.newPage();
-      await p.goto(TEST_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-      await p.addStyleTag({ content: `${OVERLAYS.join(',')} { display:none !important } html,body{overflow:auto!important;height:auto!important}` }).catch(() => {});
-      await p.waitForTimeout(250);
-      const info = await p.evaluate((sels) => {
-        for (const s of sels) {
-          try {
-            const el = document.querySelector(s);
-            if (!el) continue;
-            const t = (el.innerText || '').trim();
-            if (t.length > 100) return { sel: s, len: t.length };
-          } catch {}
-        }
-        return { sel: null, len: 0 };
-      }, SELECTORS);
-      headerChecks.push({ name: h.name, article: info });
-      await ctx.close();
-    } catch (e) {
-      headerChecks.push({ name: h.name, error: String(e).slice(0, 200) });
-    }
-  }
-  try {
-    const baseLen = headerChecks.find(h => h.name === 'default')?.article?.len || 0;
-    const diff = headerChecks
-      .filter(h => h.name !== 'default' && (h.article?.len || 0) > baseLen + 200)
-      .map(h => ({ name: h.name, exposed_len: h.article.len, base_len: baseLen }));
-    if (diff.length) {
+  /* --- XHR follow-up: re-fetch promising fragment endpoints (prefix only) --- */
+  // This step adds parity with your extension’s “post-render” checks, without storing bodies.
+  for (const rec of xhrScan) {
+    const isHtmlish = /html/.test(rec.ct || '');
+    const looksFragment = XHR_FRAGMENT_CANDIDATES.some(s => (rec.url || '').includes(s));
+    if (!isHtmlish && !looksFragment) continue;
+
+    // Re-request once with fetch -> prefix only
+    const r = await fetchText(rec.url, { headers: { 'Accept': rec.ct || 'text/html' }, timeout: 15000 });
+    if (r.error || typeof r.text !== 'string') continue;
+
+    const prefix = r.text.slice(0, 8192);
+    const sig = analyzeHtmlPrefix(prefix);
+
+    // Attach signals to existing record
+    rec.refetch = {
+      status: r.status,
+      ct: r.headers?.['content-type'] || null,
+      sha256_prefix: sha256(prefix),
+      htmlSignals: sig,
+      preview: CFG.noPreview ? undefined : short(prefix, 180)
+    };
+
+    if (sig.articleLike) {
       findings.push({
-        id: 'ua_referrer_bypass',
-        title: 'UA/Referer-based rendered differences',
-        severity: 'Medium',
-        evidence: { diffs: diff }
+        id: 'xhr_fragment_article_like',
+        title: 'XHR/Fragment likely carries article HTML',
+        severity: 'High',
+        evidence: {
+          url: rec.url,
+          ct: rec.refetch.ct,
+          htmlSignals: sig,
+          sha256_prefix: rec.refetch.sha256_prefix
+        }
       });
     }
-  } catch {}
+  }
 
-  /* ----------------------------- Save artifacts ------------------------- */
+  /* ----------------- Save artifacts ----------------- */
   try { await writeJson(path.join(targetOut, 'xhr_scan.json'), xhrScan); } catch {}
   try { await writeJson(path.join(targetOut, 'header_checks.json'), headerChecks); } catch {}
   try { await writeJson(path.join(targetOut, 'json_probes.json'), jsonProbes); } catch {}
+  try { await writeJson(path.join(targetOut, 'js_scan.json'), scriptUrls); } catch {}
   try { await writeJson(path.join(targetOut, 'raw_probes.json'), {
-    target: TEST_URL,
-    mainRequest,
-    articleDom,
-    altViews,
-    notes: rawNotes
+    target: CFG.url, articleDom, altViews, notes: rawNotes
   }); } catch {}
 
   const report = {
-    target: TEST_URL,
+    target: CFG.url,
     generatedAt: new Date().toISOString(),
     artifacts: {
       screenshots: fs.existsSync(shotsDir) ? fs.readdirSync(shotsDir).map(f => path.join('screenshots', f)) : [],
-      files: ['raw_probes.json', 'js_scan.json', 'xhr_scan.json', 'header_checks.json', 'json_probes.json'].filter(fn => fs.existsSync(path.join(targetOut, fn)))
+      files: ['raw_probes.json', 'js_scan.json', 'xhr_scan.json', 'header_checks.json', 'json_probes.json']
+        .filter(fn => fs.existsSync(path.join(targetOut, fn)))
     },
     findings
   };
   try { await writeJson(path.join(targetOut, 'report.json'), report); } catch (e) { console.error('write report failed:', e.message); }
 
-  /* ---------------------------- Console summary ------------------------- */
-  const summary = [];
-  summary.push('');
-  summary.push('=== smoke-paywall — summary ===');
-  summary.push(`Target: ${TEST_URL}`);
-  summary.push(`Main status: ${mainRequest.status || 'n/a'}`);
-  summary.push(`CSP: ${mainRequest.csp ? 'present' : 'none'}`);
-  summary.push(`Robots: ${mainRequest.robots || 'n/a'}`);
-  if (articleDom.len > 0) summary.push(`DOM article candidate: ${articleDom.sel} (len≈${articleDom.len})`);
-  const fx = (id) => findings.find(f => f.id === id);
-  if (fx('public_json')) summary.push('Finding: public_json (Critical)');
-  if (fx('xhr_article_like')) summary.push('Finding: xhr_article_like (High)');
-  if (fx('inline_hydration')) summary.push('Finding: inline_hydration');
-  if (fx('paywall_js_candidates')) summary.push('Finding: paywall_js_candidates');
-  if (fx('ua_referrer_bypass')) summary.push('Finding: ua_referrer_bypass');
-  if (fx('alt_view')) summary.push('Finding: alt_view');
-  if (fx('jsonld_article')) summary.push('Finding: jsonld_article');
-  console.log(summary.join('\n'));
-  console.log('Artifacts dir:', targetOut);
-  console.log('Report:', path.join(targetOut, 'report.json'));
+  /* ----------------- Console summary ----------------- */
+  function table(rows, headers) {
+    const all = [headers, ...rows];
+    const widths = headers.map((_, i) => Math.max(...all.map(r => String(r[i]).length)));
+    const line = (r) => '| ' + r.map((c, i) => String(c).padEnd(widths[i], ' ')).join(' | ') + ' |';
+    const sep = '+-' + widths.map(w => '-'.repeat(w)).join('-+-') + '-+';
+    return [sep, line(headers), sep, ...rows.map(line), sep].join('\n');
+  }
+
+  const sevCount = findings.reduce((m, f) => (m[f.severity] = (m[f.severity] || 0) + 1, m), {});
+  const sevRows = Object.entries(sevCount).sort((a,b)=>a[0].localeCompare(b[0])).map(([sev,c], idx)=>[idx, `'${sev}'`, c]);
+
+  console.log('\n=== Findings summary ===\n');
+  console.log(table(sevRows, ['index','Severity','Count']));
+
+  const top = findings.slice(0, 12).map((f, i) => [i, `'${f.id}'`, `'${f.title}'`, `'${f.severity}'`]);
+  console.log('\nTop findings (first 12):\n');
+  console.log(table(top, ['(index)','id','title','severity']));
+
+  console.log(`\nArtifacts dir: ${targetOut}`);
+  console.log(`Report (JSON): ${path.join(targetOut, 'report.json')}`);
+
+  // (Optional) tiny Markdown report for quick sharing
+  const md = [
+    `# Smoke report for ${CFG.url}`,
+    '',
+    '## Findings',
+    '',
+    ...findings.map(f => `- **${f.severity}** — ${f.title} (${f.id})`)
+  ].join('\n');
+  const mdPath = path.join(targetOut, 'report.md');
+  try { await fs.promises.writeFile(mdPath, md, 'utf8'); } catch {}
+  console.log(`Report (Markdown): ${mdPath}`);
+
+  console.log('\nScan complete. Stay responsible — only test with written authorization.\n');
 
   try { await context.close(); } catch {}
   try { await browser.close(); } catch {}
