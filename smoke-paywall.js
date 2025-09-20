@@ -1,20 +1,17 @@
 #!/usr/bin/env node
 /**
  * smoke-paywall.js
- * Usage :
- *   node smoke-paywall.js --url "https://exemple.tld/article"
- *   # options: --headful  --timeout 60000  --ua "MyUA/1.0"
  *
- * WARNING: Run only with explicit written authorization from the target owner.
+ * Usage:
+ *   node smoke-paywall.js --url "https://site/article" [--headful] [--timeout 60000] [--ua "UA String"]
+ *
  */
-
-
 
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
-/* ---------------------------------- CLI ---------------------------------- */
+/* ------------------------------- CLI ----------------------------------- */
 
 function parseCLI() {
   const args = process.argv.slice(2);
@@ -34,7 +31,7 @@ if (!TEST_URL) {
   process.exit(2);
 }
 
-/* ------------------------------- Utilities ------------------------------- */
+/* ----------------------------- Utils ----------------------------------- */
 
 function tsNow() { return new Date().toISOString().replace(/[:.]/g, '-'); }
 function safeName(u) { return u.replace(/[^a-z0-9._-]+/gi, '_').slice(0, 160); }
@@ -45,7 +42,7 @@ function short(s, n = 300) { return (s || '').slice(0, n); }
 const OUT_ROOT = `./smoke_paywall_${tsNow()}`;
 ensureDir(OUT_ROOT);
 
-/* ------------------------------ Heuristics ----------------------------- */
+/* -------------------------- Heuristics --------------------------------- */
 
 const SELECTORS = ['main', 'article', '.post-content', '.entry-content', '.page-content'];
 const OVERLAYS = [
@@ -68,7 +65,7 @@ function hasArticleFieldsText(txt) {
   return /"body_html"|"articleBody"|"renderedBody"|"content_html"|"contentHtml"|"<article"|"<main"/i.test(txt);
 }
 
-/* ------------------------------ HTTP helper ------------------------------ */
+/* ----------------------------- Fetch helper ---------------------------- */
 
 async function fetchText(url, opts = {}) {
   try {
@@ -87,7 +84,7 @@ async function fetchText(url, opts = {}) {
   }
 }
 
-/* ----------------------- Extraction inline (hydration) -------------------- */
+/* ------------- Inline hydration & script tag parsing ------------------- */
 
 function extractHydrationBlobsFromHtml(html) {
   const blobs = [];
@@ -107,7 +104,7 @@ function extractHydrationBlobsFromHtml(html) {
   return blobs;
 }
 
-/* --------------------------------- Main ---------------------------------- */
+/* ------------------------------ Main ----------------------------------- */
 
 (async () => {
   const targetSafe = safeName(TEST_URL);
@@ -115,6 +112,7 @@ function extractHydrationBlobsFromHtml(html) {
   ensureDir(targetOut);
   const shotsDir = path.join(targetOut, 'screenshots'); ensureDir(shotsDir);
 
+  // Collected artifacts
   const findings = [];
   const jsonProbes = [];
   const headerChecks = [];
@@ -124,7 +122,7 @@ function extractHydrationBlobsFromHtml(html) {
   const rawNotes = [];
   const mainRequest = { url: TEST_URL, headers: null, status: null, responseHeaders: null, csp: null, robots: null };
 
-  // Browser context
+  // --- Launch browser with early hooks & CDP ---
   const launchOpts = { headless: !HEADFUL };
   const contextOpts = {};
   if (UA_OVERRIDE) contextOpts.userAgent = UA_OVERRIDE;
@@ -133,23 +131,86 @@ function extractHydrationBlobsFromHtml(html) {
   const context = await browser.newContext(contextOpts);
   const page = await context.newPage();
 
-  // capture main request/response headers
-  page.on('request', (req) => {
-    if (req.isNavigationRequest() && req.url().split('#')[0] === TEST_URL.split('#')[0]) {
-      mainRequest.headers = req.headers();
+  // 1) CDP session for early network observation (metadata only)
+  const session = await context.newCDPSession(page);
+  await session.send('Network.enable');
+  await session.send('Page.enable');
+
+  session.on('Network.requestWillBeSent', (ev) => {
+    // We don’t store bodies here. Metadata only.
+    if (ev.documentURL === TEST_URL && ev.type === 'Document') {
+      mainRequest.headers = ev.request.headers || null;
     }
   });
+  session.on('Network.responseReceived', (ev) => {
+    if (ev.type === 'Document' && ev.response?.url?.split('#')[0] === TEST_URL.split('#')[0]) {
+      mainRequest.status = ev.response.status;
+      mainRequest.responseHeaders = ev.response.headers || null;
+      mainRequest.csp = (ev.response.headers?.['content-security-policy'] || ev.response.headers?.['Content-Security-Policy']) || null;
+      mainRequest.robots = (ev.response.headers?.['x-robots-tag'] || ev.response.headers?.['X-Robots-Tag']) || null;
+    }
+  });
+
+  // 2) document_start style init script: instrument fetch/XHR (metadata only)
+  await context.addInitScript(() => {
+    // This runs before any page script (as close as possible).
+    try {
+      const _origFetch = window.fetch;
+      window.fetch = async function(input, init) {
+        try {
+          const url = (typeof input === 'string') ? input : (input?.url || '');
+          const method = (init && init.method) || 'GET';
+          const body = (init && init.body) || null;
+          let opName = null;
+          if (method === 'POST' && body && typeof body === 'string' && body.length < 50000) {
+            try { opName = (JSON.parse(body)||{}).operationName || null; } catch {}
+          }
+          window.__smoke_log && window.__smoke_log({ t:'fetch', url, method, opName });
+        } catch {}
+        return _origFetch.apply(this, arguments);
+      };
+
+      const _origOpen = XMLHttpRequest.prototype.open;
+      const _origSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function(method, url) {
+        try { this.__smoke = { method, url }; } catch {}
+        return _origOpen.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype.send = function(body) {
+        try {
+          if (body && typeof body === 'string' && body.length < 50000) {
+            try { this.__smoke.opName = (JSON.parse(body)||{}).operationName || null; } catch {}
+          }
+          const info = this.__smoke || {};
+          window.__smoke_log && window.__smoke_log({ t:'xhr', url: info.url, method: info.method, opName: info.opName });
+        } catch {}
+        return _origSend.apply(this, arguments);
+      };
+
+      // lightweight bus to page for Playwright to read
+      window.__smoke_events = [];
+      window.__smoke_log = (e) => { try { window.__smoke_events.push(e); } catch {} };
+
+      // Observe one-time writes to common gating globals (metadata only)
+      const watchKeys = ['piano', 'poool', 'meter', 'paywall', 'entitlement', 'subscribe', 'metering'];
+      watchKeys.forEach((k) => {
+        try {
+          if (Object.prototype.hasOwnProperty.call(window, k)) return;
+          let _val;
+          Object.defineProperty(window, k, {
+            configurable: true,
+            set(v) { _val = v; try { window.__smoke_log({ t:'global_set', key: k, typeof: typeof v }); } catch {} },
+            get() { return _val; }
+          });
+        } catch {}
+      });
+    } catch {}
+  });
+
+  // 3) Playwright-level response observer (JSON/GraphQL metadata)
   page.on('response', async (resp) => {
     try {
       const url = resp.url();
-      if (resp.request().isNavigationRequest() && url.split('#')[0] === TEST_URL.split('#')[0]) {
-        mainRequest.status = resp.status();
-        mainRequest.responseHeaders = resp.headers();
-        mainRequest.csp = mainRequest.responseHeaders['content-security-policy'] || null;
-        mainRequest.robots = mainRequest.responseHeaders['x-robots-tag'] || null;
-      }
-
-      // XHR / JSON / GraphQL inventory (only metadata + top-level keys)
       const ct = (resp.headers()['content-type'] || '').toLowerCase();
       if (!/json|graphql/.test(ct)) return;
 
@@ -158,26 +219,18 @@ function extractHydrationBlobsFromHtml(html) {
       const reqUrl = req.url();
       const method = req.method();
 
-      // Try to capture GraphQL operationName from POST body (without storing full body)
       let operationName = null;
       if (method === 'POST') {
-        const body = req.postData();
-        if (body && body.length < 200000) { // avoid huge bodies
-          try {
-            const parsed = JSON.parse(body);
-            operationName = parsed?.operationName || null;
-          } catch {}
+        const pd = req.postData();
+        if (pd && pd.length < 200000) {
+          try { operationName = (JSON.parse(pd)||{}).operationName || null; } catch {}
         }
       }
 
+      // Read small slice to extract top-level keys only (no full body saved)
       const text = await resp.text().catch(() => null);
-      if (!text) {
-        xhrScan.push({ url: reqUrl, method, status, ct, operationName, size: null, topKeys: [] });
-        return;
-      }
-
       let keys = [];
-      try { const obj = JSON.parse(text); if (obj && typeof obj === 'object') keys = Object.keys(obj).slice(0, 30); } catch { /* ignore */ }
+      if (text) { try { const obj = JSON.parse(text); if (obj && typeof obj === 'object') keys = Object.keys(obj).slice(0, 30); } catch {} }
 
       xhrScan.push({
         url: reqUrl,
@@ -185,11 +238,11 @@ function extractHydrationBlobsFromHtml(html) {
         status,
         ct,
         operationName,
-        size: text.length,
+        size: text ? text.length : null,
         topKeys: keys
       });
 
-      if (hasArticleFieldsText(text)) {
+      if (text && hasArticleFieldsText(text)) {
         findings.push({
           id: 'xhr_article_like',
           title: 'XHR/GraphQL likely carries article HTML',
@@ -197,10 +250,10 @@ function extractHydrationBlobsFromHtml(html) {
           evidence: { url: reqUrl, status, ct, operationName, sampleKeys: keys }
         });
       }
-    } catch { /* ignore */ }
+    } catch {}
   });
 
-  /* ------------------------------- Navigation ------------------------------ */
+  /* ----------------------------- Navigate ------------------------------- */
   try {
     await page.goto(TEST_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
     await page.waitForTimeout(800);
@@ -208,7 +261,16 @@ function extractHydrationBlobsFromHtml(html) {
     rawNotes.push(`[nav] error: ${String(e).slice(0, 200)}`);
   }
 
-  // Captures (baseline → esc → scroll → hide overlays)
+  // Drain initScript events (fetch/xhr starts) — *metadata only*
+  try {
+    const early = await page.evaluate(() => (Array.isArray(window.__smoke_events) ? window.__smoke_events.splice(0) : []));
+    if (early && early.length) {
+      // Merge as "earlyHooks" in raw notes
+      rawNotes.push({ earlyHooks: early.slice(0, 200) });
+    }
+  } catch {}
+
+  // Screenshots (baseline → esc → scroll → hide overlays)
   try { await page.screenshot({ path: path.join(shotsDir, '01_baseline.png'), fullPage: true }); } catch {}
   try {
     const btn = page.locator(
@@ -234,7 +296,7 @@ function extractHydrationBlobsFromHtml(html) {
     await page.screenshot({ path: path.join(shotsDir, '04_after_css_hide.png'), fullPage: true });
   } catch {}
 
-  /* -------------------------- Article DOM detection ------------------------ */
+  /* ----------------------- Article-like DOM detection -------------------- */
   let articleDom = { sel: null, len: 0 };
   try {
     articleDom = await page.evaluate((sels) => {
@@ -259,7 +321,7 @@ function extractHydrationBlobsFromHtml(html) {
     });
   }
 
-  /* ----------------------------- AMP & JSON-LD ---------------------------- */
+  /* ------------------------- AMP & JSON-LD ------------------------------ */
   try {
     const ampHref = await page.evaluate(() => document.querySelector('link[rel="amphtml"]')?.href || null);
     if (ampHref) findings.push({ id: 'amp_variant', title: 'AMP variant advertised', severity: 'Info', evidence: { url: ampHref } });
@@ -289,9 +351,10 @@ function extractHydrationBlobsFromHtml(html) {
     }
   } catch {}
 
-  /* ---------------------- Inline hydration JSON (HTML) -------------------- */
+  /* ------------------ Inline hydration & script src scan ----------------- */
   try {
     const html = await page.content();
+
     // <link rel="alternate" ... application/json|+json|oembed>
     try {
       const altJson = [...html.matchAll(/<link[^>]+rel=["']alternate["'][^>]+type=["']([^"']*json[^"']*)["'][^>]+href=["']([^"']+)["']/ig)]
@@ -311,7 +374,8 @@ function extractHydrationBlobsFromHtml(html) {
         evidence: { blobs: blobs.length, articleLike: flagged, sampleTopKeys: sampleKeys }
       });
     }
-    // Scan des <script src=...>
+
+    // collect <script src=...>
     const re = /<script[^>]+src=(?:'|")([^'"]+)(?:'|")[^>]*>/gi;
     let m;
     while ((m = re.exec(html)) !== null) {
@@ -319,7 +383,7 @@ function extractHydrationBlobsFromHtml(html) {
     }
   } catch {}
 
-  /* -------------------------- JS paywall-like & print --------------------- */
+  // JS filenames with paywall-ish markers
   try {
     const pw = scriptUrls.filter(u => /paywall|gate|meter|subscribe|fr-gate|pay-wall|metering|piano|poool/i.test(u));
     if (pw.length) {
@@ -328,7 +392,7 @@ function extractHydrationBlobsFromHtml(html) {
     await writeJson(path.join(targetOut, 'js_scan.json'), scriptUrls);
   } catch {}
 
-  // Print CSS
+  // Print CSS hint
   try {
     const hasPrint = await page.evaluate(() => {
       try {
@@ -343,7 +407,7 @@ function extractHydrationBlobsFromHtml(html) {
     if (hasPrint) findings.push({ id: 'print_css', title: 'Print stylesheet detected', severity: 'Info' });
   } catch {}
 
-  /* ------------------------- Variables window -------------------- */
+  // window globals
   try {
     const globals = await page.evaluate(() => {
       const keys = Object.getOwnPropertyNames(window);
@@ -352,7 +416,7 @@ function extractHydrationBlobsFromHtml(html) {
     if (globals.length) findings.push({ id: 'global_flags', title: 'Potential metering/paywall globals on window', severity: 'Info', evidence: { keys: globals } });
   } catch {}
 
-  /* ------------------------------ Service Worker -------------------------- */
+  // Service worker
   try {
     const swInfo = await page.evaluate(async () => {
       try {
@@ -364,26 +428,7 @@ function extractHydrationBlobsFromHtml(html) {
     if (swInfo?.supported) findings.push({ id: 'service_worker', title: 'Service Worker present', severity: 'Info', evidence: swInfo });
   } catch {}
 
-  /* ----------------------------- Meta / Robots ---------------------------- */
-  try {
-    const metaFlags = await page.evaluate(() => {
-      const out = {};
-      const metas = Array.from(document.querySelectorAll('meta[name], meta[property]'));
-      for (const m of metas) {
-        const name = (m.getAttribute('name') || m.getAttribute('property') || '').toLowerCase();
-        if (!name) continue;
-        if (/paywall|meter|subscription|robots/.test(name)) {
-          out[name] = (m.getAttribute('content') || '').slice(0, 200);
-        }
-      }
-      return out;
-    });
-    if (Object.keys(metaFlags).length) {
-      findings.push({ id: 'meta_flags', title: 'Meta tags related to robots/meter/paywall', severity: 'Info', evidence: metaFlags });
-    }
-  } catch {}
-
-  /* ----------------------------- URL variants -------------------------- */
+  /* -------------------------- URL Variants ------------------------------ */
   const variantMakers = [
     (u) => u.replace(/\/$/, '') + '/amp',
     (u) => u + (u.includes('?') ? '&' : '?') + 'print=1',
@@ -400,7 +445,7 @@ function extractHydrationBlobsFromHtml(html) {
   }
   if (altViews.length) findings.push({ id: 'alt_view', title: 'Alternative view available (print/share/amp)', severity: 'Low', evidence: { variants: altViews } });
 
-  /* ----------------------------- Probes JSON ------------------------ */
+  /* -------------------------- JSON Endpoint Probes ---------------------- */
   const jsonCandidates = [
     TEST_URL + '.json',
     TEST_URL.replace('/pages/', '/articles/') + '.json',
@@ -437,7 +482,7 @@ function extractHydrationBlobsFromHtml(html) {
     }
   }
 
-  /* --------------------------- UA/Referer ------------------------- */
+  /* ------------------------- UA / Referer Matrix ------------------------ */
   const headerMatrix = [
     { name: 'default',   opts: {} },
     { name: 'googlebot', opts: { userAgent: 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' } },
@@ -485,7 +530,7 @@ function extractHydrationBlobsFromHtml(html) {
     }
   } catch {}
 
-  /* ------------------------------- Save all -------------------------------- */
+  /* ----------------------------- Save artifacts ------------------------- */
   try { await writeJson(path.join(targetOut, 'xhr_scan.json'), xhrScan); } catch {}
   try { await writeJson(path.join(targetOut, 'header_checks.json'), headerChecks); } catch {}
   try { await writeJson(path.join(targetOut, 'json_probes.json'), jsonProbes); } catch {}
@@ -508,9 +553,26 @@ function extractHydrationBlobsFromHtml(html) {
   };
   try { await writeJson(path.join(targetOut, 'report.json'), report); } catch (e) { console.error('write report failed:', e.message); }
 
-  console.log('Scan complete.');
-  console.log('Report:', path.join(targetOut, 'report.json'));
+  /* ---------------------------- Console summary ------------------------- */
+  const summary = [];
+  summary.push('');
+  summary.push('=== smoke-paywall — summary ===');
+  summary.push(`Target: ${TEST_URL}`);
+  summary.push(`Main status: ${mainRequest.status || 'n/a'}`);
+  summary.push(`CSP: ${mainRequest.csp ? 'present' : 'none'}`);
+  summary.push(`Robots: ${mainRequest.robots || 'n/a'}`);
+  if (articleDom.len > 0) summary.push(`DOM article candidate: ${articleDom.sel} (len≈${articleDom.len})`);
+  const fx = (id) => findings.find(f => f.id === id);
+  if (fx('public_json')) summary.push('Finding: public_json (Critical)');
+  if (fx('xhr_article_like')) summary.push('Finding: xhr_article_like (High)');
+  if (fx('inline_hydration')) summary.push('Finding: inline_hydration');
+  if (fx('paywall_js_candidates')) summary.push('Finding: paywall_js_candidates');
+  if (fx('ua_referrer_bypass')) summary.push('Finding: ua_referrer_bypass');
+  if (fx('alt_view')) summary.push('Finding: alt_view');
+  if (fx('jsonld_article')) summary.push('Finding: jsonld_article');
+  console.log(summary.join('\n'));
   console.log('Artifacts dir:', targetOut);
+  console.log('Report:', path.join(targetOut, 'report.json'));
 
   try { await context.close(); } catch {}
   try { await browser.close(); } catch {}

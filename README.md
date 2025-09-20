@@ -8,16 +8,16 @@ This tool probes a target article page for common content-exposure vectors (publ
 
 ## Features
 
-- Detects common paywall/content-exposure vectors:
-  - Public JSON (strict detection: content type + parseability + article-related keys)
-  - Inline hydration blobs (__NEXT_DATA__, __NUXT__, __APOLLO_STATE__, etc.)
-  - Post-render XHR/fetch/GraphQL requests (metadata + top-level keys)
-  - URL variants (print/amp/share/amp suffixes)
-  - UA/Referer differences (desktop, iOS mobile, Googlebot, Google/Facebook/Twitter referers)
-  - Client-side overlays (content present in the DOM)
-  - "Paywall-like" JS, global metering variables, @media print stylesheets, Service Worker
-
-- Produces a precise, machine-readable reports:
+- Detects common paywall / content-exposure vectors (metadata-only):
+    - Public JSON endpoints (strict: content-type + JSON parseability + article-related keys)
+	- Inline hydration blobs (__NEXT_DATA__, __NUXT__, __APOLLO_STATE__, etc.)
+	- Post-render XHR / fetch / GraphQL (URL, method, status, content-type, size, top-level keys)
+	- URL variants (print / amp / share / amp-suffix)
+	- UA / Referer differences (desktop, iOS mobile, Googlebot, Google/Facebook/Twitter referers)
+	- Client-side overlays (article node present in the DOM)
+	- Signals: “paywall-like” JS filenames, global metering variables, @media print stylesheets, Service Worker, JSON-LD Article markers
+	- Early hooks & CDP: document_start fetch/XHR instrumentation + CDP Network events (metadata only)
+- Produces precise, machine-readable reports and a concise console summary
   - report.json — Structured summary of findings (id, title, severity, short description) + synthetic evidence (paths, snippets, metrics)
   - raw_probes.json — Raw probe data (tested requests, statuses, errors, timings).
   - js_scan.json — List of script URLs found in HTML (for asset/host reconnaissance).
@@ -44,13 +44,7 @@ npx playwright install
 ## Usage
 
 ```bash
-node smoke-paywall.js --url "https://example.com/pages/article-handle"
-```
-
-options:
-
-```bash
- --headful  --timeout 60000  --ua "MyUA/1.0"
+node smoke-paywall.js --url "https://site/article" [--headful] [--timeout 60000] [--ua "UA String"]
 ```
 
 ## Legal & ethical
